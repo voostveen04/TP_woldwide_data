@@ -3,218 +3,239 @@ import pandas as pd
 import os
 import json
 from typing import List
+import plotly.express as px
 
-st.set_page_config(page_title="TP Worldwide Dashboard", layout="wide")
-st.title("Transfer Pricing Worldwide Data Dashboard")
-
-st.caption("Verbeterde versie met uitgebreide filters, kolom selectie & zoekfunctie.")
-
-DATA_CANDIDATES = [
-    # Primary new target file names (first match wins)
-    os.path.join(os.path.dirname(__file__), 'extracted_tp_data_v2_2.csv'),
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), 'extracted_tp_data_v2_2.csv'),
-    # Backwards compatibility fallbacks
-    os.path.join(os.path.dirname(__file__), 'extracted_tp_data_v2.csv'),
-    os.path.join(os.path.dirname(__file__), 'extracted_tp_data.csv'),
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), 'extracted_tp_data_v2.csv'),
-    os.path.join(os.path.dirname(os.path.dirname(__file__)), 'extracted_tp_data.csv'),
-]
-JSONL_CANDIDATE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'extracted_data.jsonl')
-
-EXPECTED_MIN_COLUMNS = ["Country", "TaxAuthority", "TPLaw", "TPStartDate"]
-
-@st.cache_data(show_spinner=False)
-def load_csv_first() -> pd.DataFrame:
-    for p in DATA_CANDIDATES:
-        if os.path.exists(p):
-            try:
-                df = pd.read_csv(p)
-                st.sidebar.success(f"Loaded: {os.path.basename(p)}")
-                return df
-            except Exception as e:
-                st.sidebar.warning(f"Kon {os.path.basename(p)} niet lezen: {e}")
-    return pd.DataFrame()
-
-@st.cache_data(show_spinner=False)
-def load_jsonl_fallback() -> pd.DataFrame:
-    if not os.path.exists(JSONL_CANDIDATE):
-        return pd.DataFrame()
-    rows = []
-    with open(JSONL_CANDIDATE, 'r', encoding='utf-8') as f:
-        for line in f:
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
-
-df = load_csv_first()
-if df.empty:
-    st.info("CSV niet gevonden, probeer JSONL fallback te laden…")
-    df = load_jsonl_fallback()
-
-if df.empty:
-    st.error("Geen data gevonden. Plaats 'extracted_tp_data_v2_2.csv' (of eerdere fallback bestandsnaam) of het state-bestand 'extracted_data.jsonl'.")
-    st.stop()
-
-# Basisvalidatie
-missing_core = [c for c in EXPECTED_MIN_COLUMNS if c not in df.columns]
-if missing_core:
-    st.warning(f"Ontbrekende kernkolommen: {', '.join(missing_core)}")
-else:
-    st.caption("Alle kernkolommen aanwezig.")
-
-############################################
-# Sidebar: Filters & Opties
-############################################
-st.sidebar.header("Filters")
-
-# 1. Land selectie (nu standaard ALLES geselecteerd)
-landen: List[str] = sorted(df['Country'].dropna().unique())
-selectie_landen = st.sidebar.multiselect(
-    "Landen", landen, default=landen, help="Standaard alle landen geselecteerd"
+# --- PAGINA CONFIGURATIE ---
+st.set_page_config(
+    page_title="TP Compliance Dashboard",
+    page_icon="🌍",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# 2. Snelle tekst zoekfilter (case-insensitive over alle string kolommen)
-zoekterm = st.sidebar.text_input("Zoekterm (vrije tekst)", placeholder="bv. APA, OECD, Master file")
+# --- AANGEPASTE STYLING ---
+st.markdown("""
+<style>
+    /* Strakkere containers */
+    [data-testid="stVerticalBlock"] > [style*="flex-direction: column;"] > [data-testid="stVerticalBlock"] {
+        border: 1px solid #e6e6e6;
+        border-radius: 0.5rem;
+        padding: 1rem 1rem 1rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    }
+    /* KPI Metrics */
+    [data-testid="stMetric"] {
+        background-color: #fafafa;
+        border: 1px solid #e6e6e6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+    }
+    .st-emotion-cache-1vzeuhh { /* Target de metric value */
+        font-size: 2.5rem !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# 3. Vooraf gedefinieerde ja/nee kolommen (als aanwezig)
-yn_kandidaten = [
-    'DomesticTPObligations', 'OECDorBEPS', 'OECDGuidelines', 'APAAvailable',
-    'BEPS13PenaltyProtection', 'MCAA_CbC', 'LocalFile', 'MasterFile'
-]
-actieve_yn = []
-with st.sidebar.expander("Ja/Nee filters"):
-    for col in yn_kandidaten:
-        if col in df.columns:
-            opties = sorted([x for x in df[col].dropna().unique() if str(x).strip() != ''])
-            if opties:
-                keuze = st.multiselect(col, opties, default=opties if len(opties) <= 6 else opties)  # default alle
-                actieve_yn.append((col, keuze))
 
-# 4. Dynamische categorische kolommen (kleine cardinaliteit, ex. <= 20, excl reeds opgenomen + Country)
-with st.sidebar.expander("Extra categorische filters"):
-    cat_filters = []
-    for col in df.select_dtypes(include=['object']).columns:
-        if col in ['Country'] + yn_kandidaten:
-            continue
-        unq = df[col].dropna().unique()
-        if 1 < len(unq) <= 20:  # redelijke set
-            values = sorted([x for x in unq if str(x).strip() != ''])
-            gekozen = st.multiselect(col, values, default=values)
-            cat_filters.append((col, gekozen))
+# --- DATA LADEN ---
+@st.cache_data(show_spinner="Loading data...")
+def load_data() -> pd.DataFrame:
+    """Laadt data, met CSV als prioriteit en JSONL als fallback."""
+    # Pad definities
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    csv_path = os.path.join(base_dir, 'extracted_core_tp_data.csv')
+    jsonl_path = os.path.join(base_dir, 'extracted_data_core.jsonl')
 
-# 5. Kolom selectie
-with st.sidebar.expander("Kolommen zichtbaar"):
-    alle_kolommen = list(df.columns)
-    zichtbare_kolommen = st.multiselect("Selecteer kolommen", alle_kolommen, default=alle_kolommen)
+    # 1. Probeer CSV
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            st.sidebar.success(f"Loaded: {os.path.basename(csv_path)}")
+            return df
+        except Exception as e:
+            st.sidebar.warning(f"Could not read CSV: {e}")
 
-# 6. Reset knop (herladen pagina)
-if st.sidebar.button("Reset alle filters"):
-    st.experimental_rerun()
+    # 2. Fallback naar JSONL
+    if os.path.exists(jsonl_path):
+        st.sidebar.info("CSV not found, falling back to JSONL.")
+        rows = []
+        column_mapping = {
+            "Any mandatory MF/LF filing?": "Any_mandatory_MF_LF_filing", "MF deadline": "MF_deadline",
+            "MF filing req.?": "MF_filing_req", "MF threshold*": "MF_threshold", "LF deadline": "LF_deadline",
+            "LF filing req.?": "LF_filing_req", "LF threshold*": "LF_threshold",
+            "CbCr notification deadline": "CbCr_notification_deadline", "CbCr filing deadline": "CbCr_filing_deadline",
+            "CbCr threshold": "CbCr_threshold", "Local TP reqs.": "Local_TP_reqs",
+            "Local TP reqs. deadline": "Local_TP_reqs_deadline", "Other": "Other"
+        }
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        if rows:
+            df = pd.DataFrame(rows).rename(columns=column_mapping)
+            # Zorg dat alle kolommen uit de mapping bestaan
+            for target_col in column_mapping.values():
+                if target_col not in df.columns:
+                    df[target_col] = "N/A"
+            st.sidebar.success(f"Loaded: {os.path.basename(jsonl_path)}")
+            return df
 
-############################################
-# Filtering logic
-############################################
+    return pd.DataFrame()
+
+df = load_data()
+
+if df.empty:
+    st.error("❌ No data found. Please run the `extract_core_pdf.py` script first.")
+    st.stop()
+
+# --- SIDEBAR / FILTERS ---
+with st.sidebar:
+    st.title("🌍 TP Dashboard")
+    st.markdown("---")
+    st.header("Filters")
+
+    landen = sorted(df['Country'].dropna().unique())
+    selectie_landen = st.multiselect("Countries", landen, default=landen)
+
+    zoekterm = st.text_input("Free text search", placeholder="e.g., Yes, 12 months, upon request")
+
+    with st.expander("Detailed Filters", expanded=True):
+        yn_cols = ['Any_mandatory_MF_LF_filing', 'MF_filing_req', 'LF_filing_req']
+        actieve_yn = []
+        for col in yn_cols:
+            if col in df.columns:
+                opties = sorted([x for x in df[col].dropna().unique() if str(x).strip()])
+                if opties:
+                    keuze = st.multiselect(col, opties, default=opties)
+                    actieve_yn.append((col, keuze))
+
+    with st.expander("Column Selection"):
+        zichtbare_kolommen = st.multiselect("Show columns", list(df.columns), default=list(df.columns))
+
+    if st.button("Reset Filters", use_container_width=True):
+        st.experimental_rerun()
+
+# --- FILTERING LOGIC ---
 gefilterd = df.copy()
-
-# Landen filter
 if selectie_landen:
     gefilterd = gefilterd[gefilterd['Country'].isin(selectie_landen)]
-
-# Tekst zoekterm
 if zoekterm:
     term = zoekterm.lower()
     string_cols = gefilterd.select_dtypes(include=['object']).columns
-    mask = pd.Series(False, index=gefilterd.index)
-    for c in string_cols:
-        mask = mask | gefilterd[c].fillna('').str.lower().str.contains(term)
+    mask = gefilterd[string_cols].fillna('').apply(lambda col: col.str.lower().str.contains(term)).any(axis=1)
     gefilterd = gefilterd[mask]
-
-# Ja/Nee filters
 for col, keuzes in actieve_yn:
     if keuzes:
         gefilterd = gefilterd[gefilterd[col].isin(keuzes)]
 
-# Extra categorische filters
-for col, keuzes in cat_filters:
-    if keuzes:
-        gefilterd = gefilterd[gefilterd[col].isin(keuzes)]
+# --- HOOFDPAGINA ---
+st.title("TP Compliance Overview")
+st.markdown(f"Analysis of **{len(gefilterd)}** of **{len(df)}** countries.")
 
-# Kolom subset
-if zichtbare_kolommen:
-    gefilterd = gefilterd[zichtbare_kolommen]
-
-############################################
-# KPI sectie (bovenaan)
-############################################
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Landen (totaal filtreerbaar)", df['Country'].nunique())
-col2.metric("Records selectie", len(gefilterd))
-if 'APAAvailable' in df.columns:
-    pct_apa = (gefilterd.get('APAAvailable', pd.Series(dtype=str)).fillna('').str.contains('Yes', case=False)).mean()*100
-    col3.metric("% APA (selectie)", f"{pct_apa:.0f}%")
-else:
-    col3.metric("% APA (selectie)", "n/a")
-if 'OECDorBEPS' in df.columns:
-    pct_beps = (gefilterd.get('OECDorBEPS', pd.Series(dtype=str)).fillna('').str.contains('Yes', case=False)).mean()*100
-    col4.metric("% OECD/BEPS (selectie)", f"{pct_beps:.0f}%")
-else:
-    col4.metric("% OECD/BEPS (selectie)", "n/a")
-
-############################################
-# Tabs voor data & aanvullende views
-############################################
-tab_tabel, tab_deadlines, tab_info = st.tabs(["📊 Data", "⏱ Deadlines", "ℹ️ Info"])
-
-def style_yes_no(val):
-    v = str(val).strip().lower()
-    if v == 'yes':
-        return 'background-color: #d1f5d3; color:#065f08;'
-    if v == 'no':
-        return 'background-color: #f9d6d6; color:#7a0000;'
-    return ''
-
-with tab_tabel:
-    st.subheader("Gefilterde data")
-    if gefilterd.empty:
-        st.warning("Geen resultaten voor de huidige filters")
+# --- KPI SECTIE ---
+st.markdown("### Key Metrics")
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Total Countries", df['Country'].nunique())
+with col2:
+    st.metric("Filtered Countries", gefilterd['Country'].nunique())
+with col3:
+    if not gefilterd.empty and 'Any_mandatory_MF_LF_filing' in gefilterd.columns:
+        mandatory_pct = (gefilterd['Any_mandatory_MF_LF_filing'].str.contains('Yes', case=False, na=False)).mean() * 100
+        st.metric("Mandatory Filing (selection)", f"{mandatory_pct:.0f}%")
     else:
-        # Styling toepassen op object kolommen
-        object_cols = gefilterd.select_dtypes(include=['object']).columns
-        styled = gefilterd.style.applymap(style_yes_no, subset=object_cols)
-        st.dataframe(styled, use_container_width=True, height=520)
+        st.metric("Mandatory Filing", "N/A")
+
+st.markdown("---")
+
+# --- TABS ---
+tab_data, tab_vis, tab_info = st.tabs(["📊 Data Overview", "📈 Visualizations", "ℹ️ Info"])
+
+with tab_data:
+    st.subheader("Detailed Data")
+    if gefilterd.empty:
+        st.warning("No results for the current filters.")
+    else:
+        # Definieer kolomconfiguratie voor betere weergave
+        column_config = {
+            "Country": st.column_config.TextColumn("Country", width="medium"),
+            "Other": st.column_config.LinkColumn("Other Info", width="large"),
+        }
+        # Voeg styling toe voor ja/nee kolommen
+        def style_yes_no(val):
+            v = str(val).strip().lower()
+            if 'yes' in v: return 'background-color: #e5f5e0; color:#34a853;'
+            if 'no' in v: return 'background-color: #fce8e6; color:#ea4335;'
+            return ''
+
+        display_df = gefilterd[zichtbare_kolommen] if zichtbare_kolommen else gefilterd
+        
+        st.dataframe(
+            display_df.style.applymap(style_yes_no, subset=[c for c in yn_cols if c in display_df.columns]),
+            column_config=column_config,
+            use_container_width=True,
+            height=600
+        )
         st.download_button(
-            "Download selectie (CSV)",
+            "📥 Download Selection (CSV)",
             gefilterd.to_csv(index=False).encode('utf-8-sig'),
-            file_name="tp_selection.csv",
-            mime="text/csv",
-            help="Exporteer de huidige gefilterde dataset"
+            "tp_core_selection.csv", "text/csv", use_container_width=True
         )
 
-with tab_deadlines:
-    st.subheader("Deadline kolommen")
-    possible_cols = [c for c in df.columns if 'Deadline' in c]
-    if possible_cols and not gefilterd.empty:
-        deadline_df = df[df['Country'].isin(selectie_landen)] if selectie_landen else df
-        deadline_df = deadline_df[['Country'] + possible_cols]
-        st.dataframe(deadline_df, use_container_width=True, height=520)
+with tab_vis:
+    st.subheader("Visual Analysis")
+    if gefilterd.empty:
+        st.warning("Select data to display charts.")
     else:
-        st.caption("Geen deadline kolommen of geen resultaten.")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("##### Filing Requirement Distribution")
+            # Grafiek voor MF/LF filing requirement
+            filing_req_col = 'MF_filing_req'
+            if filing_req_col in gefilterd.columns:
+                counts = gefilterd[filing_req_col].value_counts().reset_index()
+                counts.columns = [filing_req_col, 'Number of Countries']
+                
+                fig = px.pie(counts, names=filing_req_col, values='Number of Countries',
+                             title='Master File Filing Requirements', hole=0.3,
+                             color_discrete_map={'Yes': '#34a853', 'No': '#ea4335', 'No; submit upon request': '#fbbc05'})
+                fig.update_layout(legend_title_text='Requirement')
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.caption(f"Column '{filing_req_col}' not found.")
+
+        with col2:
+            st.markdown("##### Countries per Deadline Type")
+            deadline_col = 'MF_deadline'
+            if deadline_col in gefilterd.columns:
+                deadline_counts = gefilterd[deadline_col].value_counts().nlargest(10).reset_index()
+                deadline_counts.columns = ['Deadline', 'Number of Countries']
+                
+                fig2 = px.bar(deadline_counts, x='Number of Countries', y='Deadline', orientation='h',
+                              title='Top 10 Master File Deadlines', text='Number of Countries')
+                fig2.update_layout(yaxis={'categoryorder':'total ascending'})
+                fig2.update_traces(marker_color='#4285f4', textposition='outside')
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.caption(f"Column '{deadline_col}' not found.")
+
 
 with tab_info:
+    st.subheader("About this Dashboard")
     st.markdown("""
-    ### Uitleg & Tips
-    - Gebruik de filters links om dataset te verfijnen.
-    - Vrije tekst zoekt in alle tekst kolommen (case-insensitive).
-    - 'Ja/Nee filters' tonen alleen kolommen die in het bronbestand voorkomen.
-    - Via 'Kolommen zichtbaar' kun je kolommen snel aan/uit zetten voor de tabel.
-    - Reset knop herlaadt de app naar de standaard (alle landen).
-    - Download knop exporteert enkel de huidige selectie, niet de volledige dataset.
-    
-    Voeg eenvoudig extra visualisaties toe door onder de tabs extra secties toe te voegen.
+    This dashboard is designed to provide a quick and effective overview of the "core" transfer pricing compliance data.
+
+    **How to use:**
+    - **Filters:** Use the options in the sidebar to refine the dataset. You can filter by country, search by keyword, or select specific yes/no answers.
+    - **Data Overview:** The main table shows the filtered data. Columns with "Yes" or "No" are colored green or red for quick recognition.
+    - **Visualizations:** The charts provide a visual summary of the selected data, such as the distribution of filing requirements.
+    - **Download:** Use the download button below the table to export the current selection to a CSV file.
+
+    *This dashboard is built with Streamlit and Plotly Express.*
     """)
 
-st.markdown("""---\n*Klaar voor verdere uitbreiding: grafieken, pivot analyses, heatmaps enz.*""")
+st.markdown("---")
+st.caption("Dashboard v2.0 - Developed for a clean and effective data presentation.")
