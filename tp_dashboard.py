@@ -2,9 +2,12 @@ import streamlit as st
 import pandas as pd
 import os
 import json
+from typing import List
 
 st.set_page_config(page_title="TP Worldwide Dashboard", layout="wide")
 st.title("Transfer Pricing Worldwide Data Dashboard")
+
+st.caption("Verbeterde versie met uitgebreide filters, kolom selectie & zoekfunctie.")
 
 DATA_CANDIDATES = [
     # Primary new target file names (first match wins)
@@ -63,45 +66,155 @@ if missing_core:
 else:
     st.caption("Alle kernkolommen aanwezig.")
 
-# KPI's
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Landen", df['Country'].nunique())
-col2.metric("Records", len(df))
-if 'APAAvailable' in df.columns:
-    pct_apa = (df['APAAvailable'].fillna('').str.contains('Yes', case=False)).mean()*100
-    col3.metric("% APA beschikbaar", f"{pct_apa:.0f}%")
-else:
-    col3.metric("% APA beschikbaar", "n/a")
-if 'OECDorBEPS' in df.columns:
-    pct_beps = (df['OECDorBEPS'].fillna('').str.contains('Yes', case=False)).mean()*100
-    col4.metric("% OECD/BEPS", f"{pct_beps:.0f}%")
-else:
-    col4.metric("% OECD/BEPS", "n/a")
+############################################
+# Sidebar: Filters & Opties
+############################################
+st.sidebar.header("Filters")
 
-# Filters
-landen = sorted(df['Country'].dropna().unique())
-selectie = st.multiselect("Selecteer land(en)", landen, default=landen[:1])
-gefilterd = df[df['Country'].isin(selectie)] if selectie else df.iloc[0:0]
-
-st.subheader("Data")
-st.dataframe(gefilterd, use_container_width=True, height=500)
-
-# Deadlines view
-with st.expander("Deadlines (indien kolommen aanwezig)"):
-    possible_cols = [c for c in df.columns if 'Deadline' in c]
-    if possible_cols and not gefilterd.empty:
-        st.write(gefilterd[['Country'] + possible_cols].head(100))
-    else:
-        st.caption("Geen deadline kolommen of geen selectie.")
-
-# Download
-st.download_button(
-    "Download selectie (CSV)",
-    gefilterd.to_csv(index=False).encode('utf-8-sig'),
-    file_name="tp_selection.csv",
-    mime="text/csv"
+# 1. Land selectie (nu standaard ALLES geselecteerd)
+landen: List[str] = sorted(df['Country'].dropna().unique())
+selectie_landen = st.sidebar.multiselect(
+    "Landen", landen, default=landen, help="Standaard alle landen geselecteerd"
 )
 
-st.markdown("""
-*Filter, analyseer en exporteer TP-data. Voeg eenvoudig extra grafieken toe.*
-""")
+# 2. Snelle tekst zoekfilter (case-insensitive over alle string kolommen)
+zoekterm = st.sidebar.text_input("Zoekterm (vrije tekst)", placeholder="bv. APA, OECD, Master file")
+
+# 3. Vooraf gedefinieerde ja/nee kolommen (als aanwezig)
+yn_kandidaten = [
+    'DomesticTPObligations', 'OECDorBEPS', 'OECDGuidelines', 'APAAvailable',
+    'BEPS13PenaltyProtection', 'MCAA_CbC', 'LocalFile', 'MasterFile'
+]
+actieve_yn = []
+with st.sidebar.expander("Ja/Nee filters"):
+    for col in yn_kandidaten:
+        if col in df.columns:
+            opties = sorted([x for x in df[col].dropna().unique() if str(x).strip() != ''])
+            if opties:
+                keuze = st.multiselect(col, opties, default=opties if len(opties) <= 6 else opties)  # default alle
+                actieve_yn.append((col, keuze))
+
+# 4. Dynamische categorische kolommen (kleine cardinaliteit, ex. <= 20, excl reeds opgenomen + Country)
+with st.sidebar.expander("Extra categorische filters"):
+    cat_filters = []
+    for col in df.select_dtypes(include=['object']).columns:
+        if col in ['Country'] + yn_kandidaten:
+            continue
+        unq = df[col].dropna().unique()
+        if 1 < len(unq) <= 20:  # redelijke set
+            values = sorted([x for x in unq if str(x).strip() != ''])
+            gekozen = st.multiselect(col, values, default=values)
+            cat_filters.append((col, gekozen))
+
+# 5. Kolom selectie
+with st.sidebar.expander("Kolommen zichtbaar"):
+    alle_kolommen = list(df.columns)
+    zichtbare_kolommen = st.multiselect("Selecteer kolommen", alle_kolommen, default=alle_kolommen)
+
+# 6. Reset knop (herladen pagina)
+if st.sidebar.button("Reset alle filters"):
+    st.experimental_rerun()
+
+############################################
+# Filtering logic
+############################################
+gefilterd = df.copy()
+
+# Landen filter
+if selectie_landen:
+    gefilterd = gefilterd[gefilterd['Country'].isin(selectie_landen)]
+
+# Tekst zoekterm
+if zoekterm:
+    term = zoekterm.lower()
+    string_cols = gefilterd.select_dtypes(include=['object']).columns
+    mask = pd.Series(False, index=gefilterd.index)
+    for c in string_cols:
+        mask = mask | gefilterd[c].fillna('').str.lower().str.contains(term)
+    gefilterd = gefilterd[mask]
+
+# Ja/Nee filters
+for col, keuzes in actieve_yn:
+    if keuzes:
+        gefilterd = gefilterd[gefilterd[col].isin(keuzes)]
+
+# Extra categorische filters
+for col, keuzes in cat_filters:
+    if keuzes:
+        gefilterd = gefilterd[gefilterd[col].isin(keuzes)]
+
+# Kolom subset
+if zichtbare_kolommen:
+    gefilterd = gefilterd[zichtbare_kolommen]
+
+############################################
+# KPI sectie (bovenaan)
+############################################
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Landen (totaal filtreerbaar)", df['Country'].nunique())
+col2.metric("Records selectie", len(gefilterd))
+if 'APAAvailable' in df.columns:
+    pct_apa = (gefilterd.get('APAAvailable', pd.Series(dtype=str)).fillna('').str.contains('Yes', case=False)).mean()*100
+    col3.metric("% APA (selectie)", f"{pct_apa:.0f}%")
+else:
+    col3.metric("% APA (selectie)", "n/a")
+if 'OECDorBEPS' in df.columns:
+    pct_beps = (gefilterd.get('OECDorBEPS', pd.Series(dtype=str)).fillna('').str.contains('Yes', case=False)).mean()*100
+    col4.metric("% OECD/BEPS (selectie)", f"{pct_beps:.0f}%")
+else:
+    col4.metric("% OECD/BEPS (selectie)", "n/a")
+
+############################################
+# Tabs voor data & aanvullende views
+############################################
+tab_tabel, tab_deadlines, tab_info = st.tabs(["📊 Data", "⏱ Deadlines", "ℹ️ Info"])
+
+def style_yes_no(val):
+    v = str(val).strip().lower()
+    if v == 'yes':
+        return 'background-color: #d1f5d3; color:#065f08;'
+    if v == 'no':
+        return 'background-color: #f9d6d6; color:#7a0000;'
+    return ''
+
+with tab_tabel:
+    st.subheader("Gefilterde data")
+    if gefilterd.empty:
+        st.warning("Geen resultaten voor de huidige filters")
+    else:
+        # Styling toepassen op object kolommen
+        object_cols = gefilterd.select_dtypes(include=['object']).columns
+        styled = gefilterd.style.applymap(style_yes_no, subset=object_cols)
+        st.dataframe(styled, use_container_width=True, height=520)
+        st.download_button(
+            "Download selectie (CSV)",
+            gefilterd.to_csv(index=False).encode('utf-8-sig'),
+            file_name="tp_selection.csv",
+            mime="text/csv",
+            help="Exporteer de huidige gefilterde dataset"
+        )
+
+with tab_deadlines:
+    st.subheader("Deadline kolommen")
+    possible_cols = [c for c in df.columns if 'Deadline' in c]
+    if possible_cols and not gefilterd.empty:
+        deadline_df = df[df['Country'].isin(selectie_landen)] if selectie_landen else df
+        deadline_df = deadline_df[['Country'] + possible_cols]
+        st.dataframe(deadline_df, use_container_width=True, height=520)
+    else:
+        st.caption("Geen deadline kolommen of geen resultaten.")
+
+with tab_info:
+    st.markdown("""
+    ### Uitleg & Tips
+    - Gebruik de filters links om dataset te verfijnen.
+    - Vrije tekst zoekt in alle tekst kolommen (case-insensitive).
+    - 'Ja/Nee filters' tonen alleen kolommen die in het bronbestand voorkomen.
+    - Via 'Kolommen zichtbaar' kun je kolommen snel aan/uit zetten voor de tabel.
+    - Reset knop herlaadt de app naar de standaard (alle landen).
+    - Download knop exporteert enkel de huidige selectie, niet de volledige dataset.
+    
+    Voeg eenvoudig extra visualisaties toe door onder de tabs extra secties toe te voegen.
+    """)
+
+st.markdown("""---\n*Klaar voor verdere uitbreiding: grafieken, pivot analyses, heatmaps enz.*""")
